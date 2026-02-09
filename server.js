@@ -1,128 +1,81 @@
-const express = require('express');
-require('dotenv').config();
-
-const prompts = require('./prompts');
-const { sendToGemini } = require('./gemini.service');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// 🔥 أضف CORS middleware هنا في البداية
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+<!DOCTYPE html>
+<html>
+<head>
+    <title>اختبار السيرفر الجديد</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        input, button { padding: 10px; margin: 5px; }
+        button { background: #28a745; color: white; border: none; cursor: pointer; }
+        #result { background: #f8f9fa; padding: 15px; margin-top: 20px; display: none; }
+    </style>
+</head>
+<body>
+    <h3>اختبار السيرفر الجديد</h3>
     
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
-});
-
-function validateVerificationKey(userId, verificationKey) {
-    const expectedKey = `${userId}abcde57`;
-    return verificationKey === expectedKey;
-}
-
-function extractVariablesFromPrompt(prompt) {
-    const variableRegex = /\*\[([A-Z_][A-Z0-9_]*)\]\*/g;
-    const variables = new Set();
-    let match;
+    <button onclick="analyzePrompt()">تحليل البرومت</button>
+    <button onclick="sendFullRequest()">إرسال طلب كامل</button>
     
-    while ((match = variableRegex.exec(prompt)) !== null) {
-        variables.add(match[1]);
-    }
-    
-    return Array.from(variables);
-}
+    <div id="result">
+        <pre id="resultText"></pre>
+    </div>
 
-function replacePromptVariables(prompt, data) {
-    let processedPrompt = prompt;
-    const variables = extractVariablesFromPrompt(prompt);
-    
-    variables.forEach(variable => {
-        const value = data[variable] || 'لم يعلق المستخدم';
-        processedPrompt = processedPrompt.replace(new RegExp(`\\*\\[${variable}\\]\\*`, 'g'), value);
-    });
-    
-    return processedPrompt;
-}
-
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-app.post('/api/KIMO_DEV', async (req, res) => {
-    try {
-        const { userId, promptId, verificationKey, PDF_BASE64, ...variables } = req.body;
-
-        if (!userId || !promptId || !verificationKey) {
-            return res.status(403).send('ACCESS DENIED');
-        }
-
-        if (!validateVerificationKey(userId, verificationKey)) {
-            return res.status(403).send('ACCESS DENIED');
-        }
-
-        const promptTemplate = prompts[promptId];
-        if (!promptTemplate) {
-            return res.status(400).send('Invalid promptId');
-        }
-
-        const finalPrompt = replacePromptVariables(promptTemplate, { PDF_BASE64, ...variables });
-
-        const result = await sendToGemini(finalPrompt, PDF_BASE64 || '');
+    <script>
+        const SERVER = 'https://wet-aidan-kimon-66eadaf6.koyeb.app';
         
-        res.set('Content-Type', 'text/plain');
-        res.send(result);
-
-    } catch (error) {
-        console.error('Server Error:', error.message);
-        
-        if (error.message === 'AI REQUEST ENDED❤️‍🩹') {
-            return res.status(500).send('AI REQUEST ENDED❤️‍🩹');
+        async function analyzePrompt() {
+            try {
+                const res = await fetch(SERVER + '/api/analyze', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ promptId: "1" })
+                });
+                
+                const data = await res.json();
+                showResult(`📋 تحليل البرومت:\n${JSON.stringify(data, null, 2)}`);
+            } catch(e) {
+                showResult('❌ خطأ: ' + e.message);
+            }
         }
         
-        res.status(500).send(error.message);
-    }
-});
-
-// 🔥 أضف endpoint للاختبار والصحة
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'online',
-        message: 'Gemini Proxy Server is running',
-        timestamp: new Date().toISOString()
-    });
-});
-
-// 🔥 أضف endpoint لاختبار التحقق
-app.post('/api/test', (req, res) => {
-    const { userId, verificationKey } = req.body;
-    
-    if (!userId || !verificationKey) {
-        return res.status(400).json({ error: 'Missing userId or verificationKey' });
-    }
-    
-    const isValid = validateVerificationKey(userId, verificationKey);
-    
-    res.json({
-        userId,
-        verificationKey,
-        expectedKey: `${userId}abcde57`,
-        isValid,
-        message: isValid ? 'Verification successful' : 'Verification failed'
-    });
-});
-
-app.use((req, res) => {
-    res.status(404).send('ACCESS DENIED');
-});
-
-app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`✅ CORS enabled - Accepting requests from all origins`);
-    console.log(`✅ Endpoints:`);
-    console.log(`   POST /api/KIMO_DEV`);
-    console.log(`   GET  /api/health`);
-    console.log(`   POST /api/test`);
-});
+        async function sendFullRequest() {
+            // إنشاء PDF تجريبي صغير (base64)
+            const testPDF = "JVBERi0xLjQKMSAwIG9iaiA8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9Db3VudCAxCi9LaWRzIFszIDAgUl0KPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL01lZGlhQm94IFswIDAgMzAwIDE1MF0KL1BhcmVudCAyIDAgUgovQ29udGVudHMgNCAwIFIKPj4KZW5kb2JqCjQgMCBvYmoKPDwKL0xlbmd0aCA1NQo+PgpzdHJlYW0KMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgY20KQlQKMTAgNzAgVEQKL0YxIDEwIFRmCihUZXN0IFBERiBEb2N1bWVudCkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iagp4cmVmCjAgNQowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMTkgMDAwMDAgbiAKMDAwMDAwMDA3NyAwMDAwMCBuIAowMDAwMDAwMTQzIDAwMDAwIG4gCjAwMDAwMDAyMjUgMDAwMDAgbiAKdHJhaWxlcgo8PAovU2l6ZSA1Ci9Sb290IDEgMCBSCj4+CnN0YXJ0eHJlZgoyNjQKJSVFT0YK";
+            
+            const requestData = {
+                userId: "12345",
+                promptId: "1",
+                verificationKey: "12345abcde57",
+                PDF_BASE64: testPDF,
+                PAGES_COUNT: "3",
+                SUMMARY_STYLE: "تفصيلي",
+                EXPLAINER_PERSONALITY: "خبير أكاديمي",
+                USER_COMMENT: "اختبار النظام الجديد",
+                ANY_OTHER_VARIABLE: "هذا متغير إضافي"
+            };
+            
+            console.log('📤 إرسال البيانات:', requestData);
+            
+            try {
+                const res = await fetch(SERVER + '/api/KIMO_DEV', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(requestData)
+                });
+                
+                const text = await res.text();
+                showResult(`📊 الاستجابة:\nكود: ${res.status}\n\n${text}`);
+            } catch(e) {
+                showResult('❌ خطأ: ' + e.message);
+            }
+        }
+        
+        function showResult(text) {
+            document.getElementById('resultText').textContent = text;
+            document.getElementById('result').style.display = 'block';
+        }
+        
+        // اختبار تلقائي
+        setTimeout(analyzePrompt, 1000);
+    </script>
+</body>
+</html>
