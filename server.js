@@ -27,7 +27,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.post('/api/KIMO_DEV', async (req, res) => {
     try {
-        const { id, pass, data } = req.body;
+        const { id, pass, data, PDF_BASE64 } = req.body;
 
         if (!id || !pass || !data) {
             return res.status(403).send('ACCESS DENIED');
@@ -37,7 +37,7 @@ app.post('/api/KIMO_DEV', async (req, res) => {
             return res.status(403).send('ACCESS DENIED');
         }
 
-        const result = await sendToGemini(data, '');
+        const result = await sendToGemini(data, PDF_BASE64 || '');
         
         res.set('Content-Type', 'text/plain');
         res.send(result);
