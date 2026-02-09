@@ -1,81 +1,103 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>اختبار السيرفر الجديد</title>
-    <style>
-        body { font-family: Arial; padding: 20px; }
-        input, button { padding: 10px; margin: 5px; }
-        button { background: #28a745; color: white; border: none; cursor: pointer; }
-        #result { background: #f8f9fa; padding: 15px; margin-top: 20px; display: none; }
-    </style>
-</head>
-<body>
-    <h3>اختبار السيرفر الجديد</h3>
-    
-    <button onclick="analyzePrompt()">تحليل البرومت</button>
-    <button onclick="sendFullRequest()">إرسال طلب كامل</button>
-    
-    <div id="result">
-        <pre id="resultText"></pre>
-    </div>
+const express = require('express');
+require('dotenv').config();
 
-    <script>
-        const SERVER = 'https://wet-aidan-kimon-66eadaf6.koyeb.app';
+const prompts = require('./prompts');
+const { sendToGemini } = require('./gemini.service');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
+function validateVerificationKey(userId, verificationKey) {
+    const expectedKey = `${userId}abcde57`;
+    return verificationKey === expectedKey;
+}
+
+function extractAllVariables(prompt) {
+    const variableRegex = /\*\[([A-Z_][A-Z0-9_]*)\]\*/g;
+    const variables = new Set();
+    let match;
+    
+    while ((match = variableRegex.exec(prompt)) !== null) {
+        variables.add(match[1]);
+    }
+    
+    return Array.from(variables);
+}
+
+function replaceAllVariables(prompt, requestData) {
+    let finalPrompt = prompt;
+    const allVariables = extractAllVariables(prompt);
+    
+    allVariables.forEach(variable => {
+        if (requestData.hasOwnProperty(variable)) {
+            const value = requestData[variable] || 'لم يعلق المستخدم';
+            finalPrompt = finalPrompt.replace(new RegExp(`\\*\\[${variable}\\]\\*`, 'g'), value);
+        } else {
+            finalPrompt = finalPrompt.replace(new RegExp(`\\*\\[${variable}\\]\\*`, 'g'), 'لم يعلق المستخدم');
+        }
+    });
+    
+    return finalPrompt;
+}
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+app.post('/api/KIMO_DEV', async (req, res) => {
+    try {
+        const { userId, promptId, verificationKey, ...requestData } = req.body;
+
+        if (!userId || !promptId || !verificationKey) {
+            return res.status(403).send('ACCESS DENIED');
+        }
+
+        if (!validateVerificationKey(userId, verificationKey)) {
+            return res.status(403).send('ACCESS DENIED');
+        }
+
+        const promptTemplate = prompts[promptId];
+        if (!promptTemplate) {
+            return res.status(400).send('Invalid promptId');
+        }
+
+        const finalPrompt = replaceAllVariables(promptTemplate, requestData);
+        const result = await sendToGemini(finalPrompt, requestData.PDF_BASE64 || '');
         
-        async function analyzePrompt() {
-            try {
-                const res = await fetch(SERVER + '/api/analyze', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ promptId: "1" })
-                });
-                
-                const data = await res.json();
-                showResult(`📋 تحليل البرومت:\n${JSON.stringify(data, null, 2)}`);
-            } catch(e) {
-                showResult('❌ خطأ: ' + e.message);
-            }
+        res.set('Content-Type', 'text/plain');
+        res.send(result);
+
+    } catch (error) {
+        if (error.message === 'AI REQUEST ENDED❤️‍🩹') {
+            return res.status(500).send('AI REQUEST ENDED❤️‍🩹');
         }
         
-        async function sendFullRequest() {
-            // إنشاء PDF تجريبي صغير (base64)
-            const testPDF = "JVBERi0xLjQKMSAwIG9iaiA8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9Db3VudCAxCi9LaWRzIFszIDAgUl0KPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL01lZGlhQm94IFswIDAgMzAwIDE1MF0KL1BhcmVudCAyIDAgUgovQ29udGVudHMgNCAwIFIKPj4KZW5kb2JqCjQgMCBvYmoKPDwKL0xlbmd0aCA1NQo+PgpzdHJlYW0KMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgMC4wMDAgY20KQlQKMTAgNzAgVEQKL0YxIDEwIFRmCihUZXN0IFBERiBEb2N1bWVudCkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iagp4cmVmCjAgNQowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMTkgMDAwMDAgbiAKMDAwMDAwMDA3NyAwMDAwMCBuIAowMDAwMDAwMTQzIDAwMDAwIG4gCjAwMDAwMDAyMjUgMDAwMDAgbiAKdHJhaWxlcgo8PAovU2l6ZSA1Ci9Sb290IDEgMCBSCj4+CnN0YXJ0eHJlZgoyNjQKJSVFT0YK";
-            
-            const requestData = {
-                userId: "12345",
-                promptId: "1",
-                verificationKey: "12345abcde57",
-                PDF_BASE64: testPDF,
-                PAGES_COUNT: "3",
-                SUMMARY_STYLE: "تفصيلي",
-                EXPLAINER_PERSONALITY: "خبير أكاديمي",
-                USER_COMMENT: "اختبار النظام الجديد",
-                ANY_OTHER_VARIABLE: "هذا متغير إضافي"
-            };
-            
-            console.log('📤 إرسال البيانات:', requestData);
-            
-            try {
-                const res = await fetch(SERVER + '/api/KIMO_DEV', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(requestData)
-                });
-                
-                const text = await res.text();
-                showResult(`📊 الاستجابة:\nكود: ${res.status}\n\n${text}`);
-            } catch(e) {
-                showResult('❌ خطأ: ' + e.message);
-            }
-        }
-        
-        function showResult(text) {
-            document.getElementById('resultText').textContent = text;
-            document.getElementById('result').style.display = 'block';
-        }
-        
-        // اختبار تلقائي
-        setTimeout(analyzePrompt, 1000);
-    </script>
-</body>
-</html>
+        res.status(500).send(error.message);
+    }
+});
+
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'online',
+        message: 'Server is running',
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.use((req, res) => {
+    res.status(404).send('ACCESS DENIED');
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
