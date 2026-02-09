@@ -24,12 +24,12 @@ function validateVerificationKey(userId, verificationKey) {
 }
 
 function extractAllVariables(prompt) {
-    const variableRegex = /\{\{([A-Z_][A-Z0-9_]*)\}\}/g;
+    const variableRegex = /\{\{P(\d+)\}\}/g;
     const variables = new Set();
     let match;
     
     while ((match = variableRegex.exec(prompt)) !== null) {
-        variables.add(match[1]);
+        variables.add(match[0]); // حفظ {{P1}}, {{P2}}, etc.
     }
     
     return Array.from(variables);
@@ -40,11 +40,12 @@ function replaceAllVariables(prompt, requestData) {
     const allVariables = extractAllVariables(prompt);
     
     allVariables.forEach(variable => {
-        if (requestData.hasOwnProperty(variable)) {
-            const value = requestData[variable] || 'لم يعلق المستخدم';
-            finalPrompt = finalPrompt.replace(new RegExp(`\\{\\{${variable}\\}\\}`, 'g'), value);
+        const variableKey = variable.replace(/\{\{|\}\}/g, ''); // تحويل {{P1}} إلى P1
+        if (requestData.hasOwnProperty(variableKey)) {
+            const value = requestData[variableKey] || 'لم يعلق المستخدم';
+            finalPrompt = finalPrompt.replace(new RegExp(variable.replace(/[{}]/g, '\\$&'), 'g'), value);
         } else {
-            finalPrompt = finalPrompt.replace(new RegExp(`\\{\\{${variable}\\}\\}`, 'g'), 'لم يعلق المستخدم');
+            finalPrompt = finalPrompt.replace(new RegExp(variable.replace(/[{}]/g, '\\$&'), 'g'), 'لم يعلق المستخدم');
         }
     });
     
@@ -71,13 +72,30 @@ app.post('/api/KIMO_DEV', async (req, res) => {
             return res.status(400).send('Invalid promptId');
         }
 
+        console.log(`📝 البرومت ${promptId}:`);
+        console.log(`🔍 المتغيرات في الطلب:`, Object.keys(requestData));
+        
+        const variablesInPrompt = extractAllVariables(promptTemplate);
+        console.log(`🔍 المتغيرات المطلوبة في البرومت:`, variablesInPrompt);
+        
         const finalPrompt = replaceAllVariables(promptTemplate, requestData);
+        
+        // التحقق من استبدال جميع المتغيرات
+        const remainingVars = extractAllVariables(finalPrompt);
+        if (remainingVars.length > 0) {
+            console.warn(`⚠️ متغيرات لم تستبدل:`, remainingVars);
+        } else {
+            console.log(`✅ تم استبدال جميع المتغيرات`);
+        }
+        
         const result = await sendToGemini(finalPrompt, requestData.PDF_BASE64 || '');
         
         res.set('Content-Type', 'text/plain');
         res.send(result);
 
     } catch (error) {
+        console.error('❌ Server Error:', error.message);
+        
         if (error.message === 'AI REQUEST ENDED❤️‍🩹') {
             return res.status(500).send('AI REQUEST ENDED❤️‍🩹');
         }
@@ -94,10 +112,37 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+app.post('/api/analyze', (req, res) => {
+    try {
+        const { promptId } = req.body;
+        const prompt = prompts[promptId];
+        
+        if (!prompt) {
+            return res.status(400).json({ error: 'Prompt not found' });
+        }
+        
+        const variables = extractAllVariables(prompt);
+        const variableCount = variables.length;
+        
+        res.json({
+            promptId,
+            variables,
+            variableCount,
+            promptLength: prompt.length,
+            sample: prompt.substring(0, 300) + '...'
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.use((req, res) => {
     res.status(404).send('ACCESS DENIED');
 });
 
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
+    console.log(`✅ Variable format: {{P1}}, {{P2}}, {{P3}}, etc.`);
+    console.log(`✅ Available prompts: ${Object.keys(prompts).length}`);
 });
