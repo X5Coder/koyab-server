@@ -15,13 +15,18 @@ const GEMINI_API_URL =
 // ====================== قائمة الـ IPs المحظورة ======================
 const blockedIPs = new Set();
 
-// ====================== دالة جلب IP العميل ======================
+// ====================== دالة جلب IP العميل بشكل صحيح ======================
 function getClientIP(req) {
-    return req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip;
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        // خذ أول IP فقط (عميل حقيقي) في بيئات السحابة
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
-// ====================== دالة حظر IP وإرسال تليجرام ======================
-async function blockAndNotify(ip, reason, req) {
+// ====================== دالة حظر IP وإرسال تليجرام (غير متزامنة بدون await) ======================
+function blockAndNotify(ip, reason, req) {
     // إضافة IP لقائمة الحظر
     blockedIPs.add(ip);
     
@@ -41,25 +46,29 @@ async function blockAndNotify(ip, reason, req) {
                     `⏰ *الوقت:* ${timestamp}\n\n` +
                     `⚠️ هذا الـ IP تم حظره فوراً ولن يستطيع إرسال أي طلبات بعد الآن.`;
     
-    // إرسال إشعار تليجرام
-    try {
-        await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-            { 
-                chat_id: TELEGRAM_CHAT_ID, 
-                text: message,
-                parse_mode: 'Markdown'
-            },
-            { timeout: 10000 }
-        );
-        console.log(`✅ تم إبلاغ تليجرام عن IP: ${ip}`);
-    } catch (telegramError) {
-        console.error('❌ فشل إرسال إشعار تليجرام:', telegramError.message);
-    }
+    // إرسال إشعار تليجرام بدون await حتى لا يسبب تأخير
+    axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+        { 
+            chat_id: TELEGRAM_CHAT_ID, 
+            text: message,
+            parse_mode: 'Markdown'
+        },
+        { timeout: 10000 }
+    ).catch(err => {
+        console.error('❌ فشل إرسال إشعار تليجرام:', err.message);
+    });
+    
+    console.log(`✅ تم حظر IP: ${ip} - السبب: ${reason}`);
 }
 
-/* ====================== MIDDLEWARE التحقق من الحظر ====================== */
+// ====================== MIDDLEWARE التحقق من الحظر (مع استثناء health check) ======================
 app.use((req, res, next) => {
+    // استثناء مسارات health check والمسار الرئيسي
+    if (req.path === '/health' || req.path === '/' || req.path === '/api/health') {
+        return next();
+    }
+    
     const clientIP = getClientIP(req);
     
     // التحقق من أن الـ IP ليس محظوراً
@@ -200,6 +209,15 @@ async function processQueue() {
     isProcessing = false;
 }
 
+/* ====================== ROOT PATH FOR HEALTH CHECK ====================== */
+app.get('/', (req, res) => {
+    res.status(200).json({
+        status: 'online',
+        message: 'Server is running',
+        timestamp: new Date().toISOString()
+    });
+});
+
 /* ====================== ENDPOINT ====================== */
 
 app.post('/api/KIMO_DEV', async (req, res) => {
@@ -207,34 +225,34 @@ app.post('/api/KIMO_DEV', async (req, res) => {
     const clientIP = getClientIP(req);
     const { id, pass, data, PDF_BASE64 } = req.body;
 
-    // ====================== التحقق الجديد ======================
+    // ====================== التحقق الجديد (بدون await لتجنب التأخير) ======================
     
     // الحالة 1: نص فقط (data موجود لكن PDF_BASE64 فارغ)
     if (data && data !== '' && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req);
+        blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req);
         return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
     }
     
     // الحالة 2: PDF فقط (PDF_BASE64 موجود لكن data فارغ)
     if ((!data || data === '') && PDF_BASE64 && PDF_BASE64 !== '') {
-        await blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req);
+        blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req);
         return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
     }
     
     // الحالة 3: ولا حاجة (الاتنين فاضيين)
     if ((!data || data === '') && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req);
+        blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req);
         return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
     }
 
     // التحقق القديم من id و pass
     if (!id || !pass || !data) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req);
+        blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req);
         return res.status(403).send('ACCESS DENIED');
     }
 
     if (pass !== id + 'abcde57') {
-        await blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req);
+        blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req);
         return res.status(403).send('ACCESS DENIED');
     }
 
@@ -269,8 +287,9 @@ app.use('*', (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
     console.log(`✅ نظام حماية IP مفعل - عدد IPs محظورة حالياً: ${blockedIPs.size}`);
+    console.log(`✅ Health check متاح على: / و /api/health`);
 });
 
 server.timeout = 320000;
