@@ -28,8 +28,6 @@ function blockAndNotify(ip, reason, req, requestBody = null) {
     blockedIPs.add(ip);
     
     const userAgent = req.headers['user-agent'] || 'غير معروف';
-    const method = req.method;
-    const url = req.originalUrl;
     const timestamp = new Date().toISOString();
     
     let requestDetails = '';
@@ -64,7 +62,7 @@ app.use((req, res, next) => {
     
     if (blockedIPs.has(clientIP)) {
         console.log(`🚫 مرفوض من IP محظور: ${clientIP}`);
-        res.status(403).end();
+        res.status(403).json({ error: 'IP blocked' });
         return;
     }
     
@@ -72,7 +70,8 @@ app.use((req, res, next) => {
 });
 
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    const origin = req.headers.origin;
+    res.header('Access-Control-Allow-Origin', origin || '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Credentials', 'true');
@@ -152,7 +151,7 @@ async function processQueue() {
 
     while (requestQueue.length > 0) {
         const job = requestQueue.shift();
-        const { req, res, prompt, pdf } = job;
+        const { res, prompt, pdf } = job;
 
         try {
             const result = await sendToGemini(prompt, pdf);
@@ -162,7 +161,7 @@ async function processQueue() {
             }
         } catch (error) {
             if (!res.headersSent) {
-                res.status(500).send('AI REQUEST FAILED');
+                res.status(500).json({ error: 'AI request failed' });
             }
         }
         await new Promise(r => setTimeout(r, REQUEST_DELAY));
@@ -177,37 +176,34 @@ app.post('/api/KIMO_DEV', (req, res) => {
     const hasText = data && data !== '';
     const hasPdf = PDF_BASE64 && PDF_BASE64 !== '';
 
-    // التحقق من الطلبات المخالفة
     if (hasText && !hasPdf) {
         blockAndNotify(clientIP, 'نص فقط بدون PDF', req, { data, PDF_BASE64 });
-        return res.status(403).end();
+        return res.status(403).json({ error: 'نص فقط بدون ملف PDF - تم حظرك' });
     }
     
     if (!hasText && hasPdf) {
         blockAndNotify(clientIP, 'PDF فقط بدون نص', req, { data, PDF_BASE64 });
-        return res.status(403).end();
+        return res.status(403).json({ error: 'PDF فقط بدون نص - تم حظرك' });
     }
     
     if (!hasText && !hasPdf) {
         blockAndNotify(clientIP, 'طلب فارغ', req, { data, PDF_BASE64 });
-        return res.status(403).end();
+        return res.status(403).json({ error: 'طلب فارغ - تم حظرك' });
     }
 
-    // التحقق من المصادقة
     if (!id || !pass) {
         blockAndNotify(clientIP, 'بدون id/pass', req, { data, PDF_BASE64 });
-        return res.status(403).end();
+        return res.status(403).json({ error: 'بيانات غير صحيحة' });
     }
 
     if (pass !== id + 'abcde57') {
         blockAndNotify(clientIP, `pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
-        return res.status(403).end();
+        return res.status(403).json({ error: 'بيانات غير صحيحة' });
     }
 
     req.setTimeout(310000);
 
     requestQueue.push({
-        req,
         res,
         prompt: data,
         pdf: PDF_BASE64
@@ -231,7 +227,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('*', (req, res) => {
-    res.status(404).end();
+    res.status(404).json({ error: 'Not found' });
 });
 
 const server = app.listen(PORT, () => {
