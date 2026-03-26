@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-const geoip = require('geoip-lite');
 require('dotenv').config();
 
 const app = express();
@@ -24,6 +23,8 @@ function getClientIP(req) {
 }
 
 async function blockAndNotify(ip, reason, req, requestBody = null) {
+    if (blockedIPs.has(ip)) return;
+    
     blockedIPs.add(ip);
     
     const userAgent = req.headers['user-agent'] || 'غير معروف';
@@ -31,45 +32,37 @@ async function blockAndNotify(ip, reason, req, requestBody = null) {
     const url = req.originalUrl;
     const timestamp = new Date().toISOString();
     
-    let locationInfo = 'غير متاح';
-    const geo = geoip.lookup(ip);
-    if (geo) {
-        locationInfo = `${geo.country} (${geo.city || 'غير معروف'}) - ${geo.ll ? geo.ll.join(', ') : 'غير متاح'}`;
-    }
-    
     let requestDetails = '';
     if (requestBody) {
-        requestDetails = `\n\n📦 *بيانات الطلب:*\n`;
+        requestDetails = `\n\n📦 بيانات الطلب:\n`;
         if (requestBody.data) {
-            const promptPreview = requestBody.data.length > 200 ? requestBody.data.substring(0, 200) + '...' : requestBody.data;
-            requestDetails += `📝 *النص المرسل:*\n\`\`\`\n${promptPreview}\n\`\`\`\n`;
+            const promptPreview = requestBody.data.length > 300 ? requestBody.data.substring(0, 300) + '...' : requestBody.data;
+            requestDetails += `📝 النص المرسل:\n${promptPreview}\n`;
         }
         if (requestBody.PDF_BASE64) {
             const pdfSize = Math.round(requestBody.PDF_BASE64.length * 0.75 / 1024);
-            requestDetails += `📄 *ملف PDF:* موجود (${pdfSize} KB)\n`;
+            requestDetails += `📄 ملف PDF: موجود (${pdfSize} KB)\n`;
         }
     }
     
-    const message = `🚨 *تم حظر حرامي* 🚨\n\n` +
-                    `📍 *السبب:* ${reason}\n` +
-                    `🔒 *الـ IP:* ${ip}\n` +
-                    `🌍 *الدولة/الموقع:* ${locationInfo}\n` +
-                    `🖥️ *المتصفح:* ${userAgent}\n` +
-                    `📡 *الطريقة:* ${method}\n` +
-                    `🔗 *الرابط:* ${url}\n` +
-                    `⏰ *الوقت:* ${timestamp}\n` +
+    const message = `🚨 تم حظر حرامي 🚨\n\n` +
+                    `السبب: ${reason}\n` +
+                    `الـ IP: ${ip}\n` +
+                    `المتصفح: ${userAgent}\n` +
+                    `الطريقة: ${method}\n` +
+                    `الرابط: ${url}\n` +
+                    `الوقت: ${timestamp}\n` +
                     `${requestDetails}\n\n` +
-                    `⚠️ هذا الـ IP تم حظره فوراً ولن يستطيع إرسال أي طلبات بعد الآن.`;
+                    `هذا الـ IP تم حظره فوراً.`;
     
     try {
         await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
             { 
                 chat_id: TELEGRAM_CHAT_ID, 
-                text: message,
-                parse_mode: 'Markdown'
+                text: message
             },
-            { timeout: 10000 }
+            { timeout: 5000 }
         );
         console.log(`✅ تم إبلاغ تليجرام عن IP: ${ip}`);
     } catch (telegramError) {
@@ -111,7 +104,7 @@ async function sendTelegramMessage(message) {
         await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
             { chat_id: TELEGRAM_CHAT_ID, text: message },
-            { timeout: 10000 }
+            { timeout: 5000 }
         );
     } catch {}
 }
@@ -215,31 +208,31 @@ app.post('/api/KIMO_DEV', async (req, res) => {
     const { id, pass, data, PDF_BASE64 } = req.body;
 
     if (data && data !== '' && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req, { data, PDF_BASE64 });
+        blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req, { data, PDF_BASE64 });
         res.status(403).end();
         return;
     }
     
     if ((!data || data === '') && PDF_BASE64 && PDF_BASE64 !== '') {
-        await blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req, { data, PDF_BASE64 });
+        blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req, { data, PDF_BASE64 });
         res.status(403).end();
         return;
     }
     
     if ((!data || data === '') && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req, { data, PDF_BASE64 });
+        blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req, { data, PDF_BASE64 });
         res.status(403).end();
         return;
     }
 
     if (!id || !pass || !data) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req, { data, PDF_BASE64 });
+        blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req, { data, PDF_BASE64 });
         res.status(403).end();
         return;
     }
 
     if (pass !== id + 'abcde57') {
-        await blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
+        blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
         res.status(403).end();
         return;
     }
@@ -276,7 +269,7 @@ app.use('*', (req, res) => {
 
 const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`✅ نظام حماية IP مفعل - عدد IPs محظورة حالياً: ${blockedIPs.size}`);
+    console.log(`نظام حماية IP مفعل - عدد IPs محظورة: ${blockedIPs.size}`);
 });
 
 server.timeout = 320000;
