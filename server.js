@@ -1,47 +1,66 @@
 const express = require('express');
 const axios = require('axios');
+const geoip = require('geoip-lite');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TELEGRAM_TOKEN = '7802578624:AAGE1qMNqrVBs_0E6QakmsiMNFTV0ZlVs54';
+const TELEGRAM_TOKEN = '8270884971:AAHoFrlytzmQ5XtqFeYG8CZUdcCiPGqgozw';
 const TELEGRAM_CHAT_ID = '1905862979';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL =
 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
-// ====================== قائمة الـ IPs المحظورة ======================
 const blockedIPs = new Set();
 
-// ====================== دالة جلب IP العميل ======================
 function getClientIP(req) {
-    return req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip;
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
-// ====================== دالة حظر IP وإرسال تليجرام ======================
-async function blockAndNotify(ip, reason, req) {
-    // إضافة IP لقائمة الحظر
+async function blockAndNotify(ip, reason, req, requestBody = null) {
     blockedIPs.add(ip);
     
-    // تجهيز معلومات إضافية
     const userAgent = req.headers['user-agent'] || 'غير معروف';
     const method = req.method;
     const url = req.originalUrl;
     const timestamp = new Date().toISOString();
     
-    // رسالة التليجرام
+    let locationInfo = 'غير متاح';
+    const geo = geoip.lookup(ip);
+    if (geo) {
+        locationInfo = `${geo.country} (${geo.city || 'غير معروف'}) - ${geo.ll ? geo.ll.join(', ') : 'غير متاح'}`;
+    }
+    
+    let requestDetails = '';
+    if (requestBody) {
+        requestDetails = `\n\n📦 *بيانات الطلب:*\n`;
+        if (requestBody.data) {
+            const promptPreview = requestBody.data.length > 200 ? requestBody.data.substring(0, 200) + '...' : requestBody.data;
+            requestDetails += `📝 *النص المرسل:*\n\`\`\`\n${promptPreview}\n\`\`\`\n`;
+        }
+        if (requestBody.PDF_BASE64) {
+            const pdfSize = Math.round(requestBody.PDF_BASE64.length * 0.75 / 1024);
+            requestDetails += `📄 *ملف PDF:* موجود (${pdfSize} KB)\n`;
+        }
+    }
+    
     const message = `🚨 *تم حظر حرامي* 🚨\n\n` +
                     `📍 *السبب:* ${reason}\n` +
                     `🔒 *الـ IP:* ${ip}\n` +
+                    `🌍 *الدولة/الموقع:* ${locationInfo}\n` +
                     `🖥️ *المتصفح:* ${userAgent}\n` +
                     `📡 *الطريقة:* ${method}\n` +
                     `🔗 *الرابط:* ${url}\n` +
-                    `⏰ *الوقت:* ${timestamp}\n\n` +
+                    `⏰ *الوقت:* ${timestamp}\n` +
+                    `${requestDetails}\n\n` +
                     `⚠️ هذا الـ IP تم حظره فوراً ولن يستطيع إرسال أي طلبات بعد الآن.`;
     
-    // إرسال إشعار تليجرام
     try {
         await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
@@ -58,20 +77,18 @@ async function blockAndNotify(ip, reason, req) {
     }
 }
 
-/* ====================== MIDDLEWARE التحقق من الحظر ====================== */
 app.use((req, res, next) => {
     const clientIP = getClientIP(req);
     
-    // التحقق من أن الـ IP ليس محظوراً
     if (blockedIPs.has(clientIP)) {
         console.log(`🚫 طلب مرفوض من IP محظور: ${clientIP}`);
-        return res.status(403).send('🚫 لقد تم حظرك نهائياً بسبب محاولة استخدام API بشكل غير مصرح به.');
+        res.status(403).end();
+        return;
     }
     
     next();
 });
 
-/* ====================== CORS ====================== */
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers',
@@ -85,13 +102,9 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '500mb' }));
 
-/* ====================== QUEUE ====================== */
-
 const requestQueue = [];
 let isProcessing = false;
 const REQUEST_DELAY = 4500;
-
-/* ====================== TELEGRAM ====================== */
 
 async function sendTelegramMessage(message) {
     try {
@@ -102,8 +115,6 @@ async function sendTelegramMessage(message) {
         );
     } catch {}
 }
-
-/* ====================== GEMINI CALL ====================== */
 
 async function sendToGemini(prompt, pdfBase64, attempt = 1) {
 
@@ -166,8 +177,6 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1) {
     }
 }
 
-/* ====================== WORKER ====================== */
-
 async function processQueue() {
 
     if (isProcessing) return;
@@ -200,48 +209,43 @@ async function processQueue() {
     isProcessing = false;
 }
 
-/* ====================== ENDPOINT ====================== */
-
 app.post('/api/KIMO_DEV', async (req, res) => {
 
     const clientIP = getClientIP(req);
     const { id, pass, data, PDF_BASE64 } = req.body;
 
-    // ====================== التحقق الجديد ======================
-    
-    // الحالة 1: نص فقط (data موجود لكن PDF_BASE64 فارغ)
     if (data && data !== '' && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req);
-        return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
+        await blockAndNotify(clientIP, 'محاولة إرسال نص فقط بدون ملف PDF', req, { data, PDF_BASE64 });
+        res.status(403).end();
+        return;
     }
     
-    // الحالة 2: PDF فقط (PDF_BASE64 موجود لكن data فارغ)
     if ((!data || data === '') && PDF_BASE64 && PDF_BASE64 !== '') {
-        await blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req);
-        return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
+        await blockAndNotify(clientIP, 'محاولة إرسال ملف PDF فقط بدون نص', req, { data, PDF_BASE64 });
+        res.status(403).end();
+        return;
     }
     
-    // الحالة 3: ولا حاجة (الاتنين فاضيين)
     if ((!data || data === '') && (!PDF_BASE64 || PDF_BASE64 === '')) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req);
-        return res.status(403).send('يا حرامي حسابك عند ربنا سارق api بتاعي ... انا مش مسامح');
+        await blockAndNotify(clientIP, 'محاولة إرسال طلب فارغ بدون نص ولا PDF', req, { data, PDF_BASE64 });
+        res.status(403).end();
+        return;
     }
 
-    // التحقق القديم من id و pass
     if (!id || !pass || !data) {
-        await blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req);
-        return res.status(403).send('ACCESS DENIED');
+        await blockAndNotify(clientIP, 'محاولة إرسال طلب بدون id أو pass', req, { data, PDF_BASE64 });
+        res.status(403).end();
+        return;
     }
 
     if (pass !== id + 'abcde57') {
-        await blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req);
-        return res.status(403).send('ACCESS DENIED');
+        await blockAndNotify(clientIP, `محاولة استخدام pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
+        res.status(403).end();
+        return;
     }
 
-    /* منع انتهاء الاتصال */
     req.setTimeout(310000);
 
-    /* إدخال في الطابور */
     requestQueue.push({
         req,
         res,
@@ -252,7 +256,9 @@ app.post('/api/KIMO_DEV', async (req, res) => {
     processQueue();
 });
 
-/* ====================== HEALTH ====================== */
+app.get('/', (req, res) => {
+    res.status(200).send('Server is running');
+});
 
 app.get('/api/health', (req, res) => {
     res.json({
@@ -265,7 +271,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('*', (req, res) => {
-    res.status(404).send('ACCESS DENIED');
+    res.status(404).end();
 });
 
 const server = app.listen(PORT, () => {
