@@ -5,8 +5,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TELEGRAM_TOKEN = '8270884971:AAHoFrlytzmQ5XtqFeYG8CZUdcCiPGqgozw';
-const TELEGRAM_CHAT_ID = '1905862979';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL =
@@ -14,8 +14,9 @@ const GEMINI_API_URL =
 
 const blockedIPs = new Set();
 let rateLimitBlockUntil = 0;
-let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 3000;
+const MAX_CONCURRENT = 3;
+let activeRequests = 0;
+const requestQueue = [];
 
 function getClientIP(req) {
     const forwarded = req.headers['x-forwarded-for'];
@@ -25,14 +26,15 @@ function getClientIP(req) {
     return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
-async function sendTelegramNotification(message, isError = true) {
+async function sendTelegramNotification(message) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     try {
         await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             { chat_id: TELEGRAM_CHAT_ID, text: message },
             { timeout: 5000 }
         );
-        console.log(`📨 تم إرسال إشعار: ${message.substring(0, 50)}...`);
+        console.log(`📨 تم إرسال إشعار`);
     } catch (err) {
         console.error('❌ فشل إرسال إشعار:', err.message);
     }
@@ -58,25 +60,18 @@ function blockAndNotify(ip, reason, req, requestBody = null) {
         }
     }
     
-    const message = `🚨 حظر IP 🚨\n` +
-                    `السبب: ${reason}\n` +
-                    `IP: ${ip}\n` +
-                    `المتصفح: ${userAgent}\n` +
-                    `الوقت: ${timestamp}${requestDetails}`;
+    const message = `🚨 حظر IP 🚨\nالسبب: ${reason}\nIP: ${ip}\nالمتصفح: ${userAgent}\nالوقت: ${timestamp}${requestDetails}`;
     
-    sendTelegramNotification(message, true);
+    sendTelegramNotification(message);
     console.log(`🚫 تم حظر ${ip} - ${reason}`);
 }
 
 app.use((req, res, next) => {
     const clientIP = getClientIP(req);
-    
     if (blockedIPs.has(clientIP)) {
         console.log(`🚫 مرفوض من IP محظور: ${clientIP}`);
-        res.status(403).json({ error: 'IP blocked' });
-        return;
+        return res.status(403).json({ error: 'IP blocked' });
     }
-    
     next();
 });
 
@@ -86,21 +81,14 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Credentials', 'true');
-
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
 app.use(express.json({ limit: '500mb' }));
 
-const requestQueue = [];
-let isProcessing = false;
-
-async function sendToGemini(prompt, pdfBase64, attempt = 1) {
+async function sendToGemini(prompt, pdfBase64, attempt = 1, requestId = null) {
     const parts = [{ text: prompt }];
-
     if (pdfBase64 && pdfBase64 !== '') {
         parts.push({
             inline_data: {
@@ -122,10 +110,7 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1) {
         const response = await axios.post(
             `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
             requestBody,
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 300000
-            }
+            { headers: { 'Content-Type': 'application/json' }, timeout: 300000 }
         );
 
         if (response.data?.candidates?.[0]) {
@@ -137,42 +122,22 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1) {
         const errorMessage = error.response?.data?.error?.message || error.message;
         const statusCode = error.response?.status;
         
+        await sendTelegramNotification(
+            `⚠️ خطأ في Gemini\nالمعرف: ${requestId}\nالحالة: ${statusCode}\nالمحاولة: ${attempt}\nالخطأ: ${errorMessage}`
+        );
+        
         if (statusCode === 429 && attempt <= 5) {
             let backoff = 0;
-            if (errorMessage) {
-                const match = errorMessage.match(/(\d+)s/);
-                if (match) {
-                    backoff = parseInt(match[1]) * 1000;
-                }
-            }
-            if (backoff === 0) {
-                backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
-            }
+            const match = errorMessage.match(/(\d+)s/);
+            if (match) backoff = parseInt(match[1]) * 1000;
+            if (backoff === 0) backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
             
             const waitTime = backoff + 2000;
             rateLimitBlockUntil = Date.now() + waitTime;
             
-            await sendTelegramNotification(
-                `⚠️ Rate Limit 429 من Gemini\n` +
-                `الانتظار: ${waitTime/1000} ثانية\n` +
-                `المحاولة: ${attempt}/5\n` +
-                `السبب: ${errorMessage}\n` +
-                `سيتم إيقاف الطلبات حتى ${new Date(rateLimitBlockUntil).toLocaleTimeString()}`,
-                true
-            );
-            
+            await sendTelegramNotification(`⚠️ Rate Limit ${waitTime/1000} ثانية`);
             await new Promise(r => setTimeout(r, waitTime));
-            return sendToGemini(prompt, pdfBase64, attempt + 1);
-        }
-        
-        if (statusCode !== 403 && statusCode !== 429) {
-            await sendTelegramNotification(
-                `⚠️ خطأ غير متوقع من Gemini\n` +
-                `الحالة: ${statusCode || 'unknown'}\n` +
-                `الخطأ: ${errorMessage}\n` +
-                `المحاولة: ${attempt}`,
-                true
-            );
+            return sendToGemini(prompt, pdfBase64, attempt + 1, requestId);
         }
         
         throw new Error(`AI_REQUEST_FAILED: ${errorMessage}`);
@@ -180,56 +145,47 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1) {
 }
 
 async function processQueue() {
-    if (isProcessing) return;
-    isProcessing = true;
-
-    while (requestQueue.length > 0) {
-        const job = requestQueue.shift();
-        const { res, prompt, pdf } = job;
-
-        const now = Date.now();
-        if (rateLimitBlockUntil > now) {
-            const waitTime = rateLimitBlockUntil - now;
-            console.log(`⏳ انتظار ${waitTime/1000} ثانية بسبب Rate Limit...`);
-            await new Promise(r => setTimeout(r, waitTime));
-        }
-        
-        const timeSinceLastRequest = Date.now() - lastRequestTime;
-        if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-            const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-            console.log(`⏳ انتظار ${waitTime/1000} ثانية بين الطلبات...`);
-            await new Promise(r => setTimeout(r, waitTime));
-        }
-
-        try {
-            const result = await sendToGemini(prompt, pdf);
-            lastRequestTime = Date.now();
-            if (!res.headersSent) {
-                res.set('Content-Type', 'text/plain; charset=utf-8');
-                res.send(result);
-            }
-        } catch (error) {
-            lastRequestTime = Date.now();
-            if (!res.headersSent) {
-                res.status(500).json({ error: error.message || 'AI request failed' });
-            }
-        }
+    if (activeRequests >= MAX_CONCURRENT) return;
+    if (requestQueue.length === 0) return;
+    
+    const now = Date.now();
+    if (rateLimitBlockUntil > now) {
+        setTimeout(processQueue, rateLimitBlockUntil - now);
+        return;
     }
-    isProcessing = false;
+    
+    while (requestQueue.length > 0 && activeRequests < MAX_CONCURRENT) {
+        const job = requestQueue.shift();
+        activeRequests++;
+        
+        (async () => {
+            try {
+                const result = await sendToGemini(job.prompt, job.pdf, 1, job.requestId);
+                if (!job.res.headersSent) {
+                    job.res.set('Content-Type', 'text/plain; charset=utf-8');
+                    job.res.send(result);
+                }
+            } catch (error) {
+                if (!job.res.headersSent) {
+                    job.res.status(500).json({ error: error.message || 'AI request failed' });
+                }
+            } finally {
+                activeRequests--;
+                processQueue();
+            }
+        })();
+    }
 }
 
 app.post('/api/KIMO_DEV', (req, res) => {
     const clientIP = getClientIP(req);
     const { id, pass, data, PDF_BASE64 } = req.body;
+    const requestId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
     const now = Date.now();
     if (rateLimitBlockUntil > now) {
         const waitSeconds = Math.ceil((rateLimitBlockUntil - now) / 1000);
-        console.log(`⏸️ طلب مؤجل بسبب Rate Limit - انتظار ${waitSeconds} ثانية`);
-        return res.status(429).json({ 
-            error: `Rate limit active, please wait ${waitSeconds} seconds`,
-            retryAfter: waitSeconds
-        });
+        return res.status(429).json({ error: `Rate limit active, wait ${waitSeconds}s`, retryAfter: waitSeconds });
     }
 
     const hasText = data && data !== '';
@@ -262,12 +218,9 @@ app.post('/api/KIMO_DEV', (req, res) => {
 
     req.setTimeout(310000);
 
-    requestQueue.push({
-        res,
-        prompt: data,
-        pdf: PDF_BASE64
-    });
-
+    requestQueue.push({ res, prompt: data, pdf: PDF_BASE64, requestId });
+    console.log(`📥 طلب ${requestId} دخل الطابور - الطابور: ${requestQueue.length} | نشط: ${activeRequests}/${MAX_CONCURRENT}`);
+    
     processQueue();
 });
 
@@ -280,12 +233,11 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'online',
         queue_length: requestQueue.length,
-        processing: isProcessing,
+        active_requests: activeRequests,
+        max_concurrent: MAX_CONCURRENT,
         blocked_ips_count: blockedIPs.size,
         rate_limit_active: rateLimitBlockUntil > now,
         rate_limit_remaining_seconds: rateLimitBlockUntil > now ? Math.ceil((rateLimitBlockUntil - now) / 1000) : 0,
-        last_request_ms_ago: lastRequestTime ? Date.now() - lastRequestTime : null,
-        min_interval_ms: MIN_REQUEST_INTERVAL,
         timestamp: new Date().toISOString()
     });
 });
@@ -296,9 +248,9 @@ app.use('*', (req, res) => {
 
 const server = app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
-    console.log(`🛡️ نظام حماية IP مفعل - عدد IPs محظورة: ${blockedIPs.size}`);
-    console.log(`⏱️ الفاصل الزمني بين الطلبات: ${MIN_REQUEST_INTERVAL/1000} ثانية`);
-    console.log(`📊 نظام تنظيم الطلبات (Queue) مفعل`);
+    console.log(`🛡️ IP Blocking Active`);
+    console.log(`⚡ Concurrent: ${MAX_CONCURRENT}`);
+    console.log(`🤖 Telegram Notifications Active`);
 });
 
 server.timeout = 320000;
