@@ -13,6 +13,9 @@ const GEMINI_API_URL =
 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
 const blockedIPs = new Set();
+let rateLimitBlockUntil = 0;
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 3000;
 
 function getClientIP(req) {
     const forwarded = req.headers['x-forwarded-for'];
@@ -20,6 +23,19 @@ function getClientIP(req) {
         return forwarded.split(',')[0].trim();
     }
     return req.socket.remoteAddress || req.ip || 'unknown';
+}
+
+async function sendTelegramNotification(message, isError = true) {
+    try {
+        await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+            { chat_id: TELEGRAM_CHAT_ID, text: message },
+            { timeout: 5000 }
+        );
+        console.log(`📨 تم إرسال إشعار: ${message.substring(0, 50)}...`);
+    } catch (err) {
+        console.error('❌ فشل إرسال إشعار:', err.message);
+    }
 }
 
 function blockAndNotify(ip, reason, req, requestBody = null) {
@@ -48,12 +64,7 @@ function blockAndNotify(ip, reason, req, requestBody = null) {
                     `المتصفح: ${userAgent}\n` +
                     `الوقت: ${timestamp}${requestDetails}`;
     
-    axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-        { chat_id: TELEGRAM_CHAT_ID, text: message },
-        { timeout: 5000 }
-    ).catch(() => {});
-    
+    sendTelegramNotification(message, true);
     console.log(`🚫 تم حظر ${ip} - ${reason}`);
 }
 
@@ -86,17 +97,6 @@ app.use(express.json({ limit: '500mb' }));
 
 const requestQueue = [];
 let isProcessing = false;
-const REQUEST_DELAY = 4500;
-
-async function sendTelegramMessage(message) {
-    try {
-        await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-            { chat_id: TELEGRAM_CHAT_ID, text: message },
-            { timeout: 5000 }
-        );
-    } catch {}
-}
 
 async function sendToGemini(prompt, pdfBase64, attempt = 1) {
     const parts = [{ text: prompt }];
@@ -134,14 +134,48 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1) {
         throw new Error('INVALID_GEMINI_RESPONSE');
 
     } catch (error) {
-        if (error.response?.status === 429 && attempt <= 5) {
-            const backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
-            await sendTelegramMessage(`429 Rate Limit → Retry in ${backoff/1000}s (Attempt ${attempt})`);
-            await new Promise(r => setTimeout(r, backoff));
+        const errorMessage = error.response?.data?.error?.message || error.message;
+        const statusCode = error.response?.status;
+        
+        if (statusCode === 429 && attempt <= 5) {
+            let backoff = 0;
+            if (errorMessage) {
+                const match = errorMessage.match(/(\d+)s/);
+                if (match) {
+                    backoff = parseInt(match[1]) * 1000;
+                }
+            }
+            if (backoff === 0) {
+                backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
+            }
+            
+            const waitTime = backoff + 2000;
+            rateLimitBlockUntil = Date.now() + waitTime;
+            
+            await sendTelegramNotification(
+                `⚠️ Rate Limit 429 من Gemini\n` +
+                `الانتظار: ${waitTime/1000} ثانية\n` +
+                `المحاولة: ${attempt}/5\n` +
+                `السبب: ${errorMessage}\n` +
+                `سيتم إيقاف الطلبات حتى ${new Date(rateLimitBlockUntil).toLocaleTimeString()}`,
+                true
+            );
+            
+            await new Promise(r => setTimeout(r, waitTime));
             return sendToGemini(prompt, pdfBase64, attempt + 1);
         }
-        await sendTelegramMessage(`Gemini API Failed: ${error.message}`);
-        throw new Error('AI_REQUEST_FAILED');
+        
+        if (statusCode !== 403 && statusCode !== 429) {
+            await sendTelegramNotification(
+                `⚠️ خطأ غير متوقع من Gemini\n` +
+                `الحالة: ${statusCode || 'unknown'}\n` +
+                `الخطأ: ${errorMessage}\n` +
+                `المحاولة: ${attempt}`,
+                true
+            );
+        }
+        
+        throw new Error(`AI_REQUEST_FAILED: ${errorMessage}`);
     }
 }
 
@@ -153,18 +187,33 @@ async function processQueue() {
         const job = requestQueue.shift();
         const { res, prompt, pdf } = job;
 
+        const now = Date.now();
+        if (rateLimitBlockUntil > now) {
+            const waitTime = rateLimitBlockUntil - now;
+            console.log(`⏳ انتظار ${waitTime/1000} ثانية بسبب Rate Limit...`);
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+        
+        const timeSinceLastRequest = Date.now() - lastRequestTime;
+        if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+            const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+            console.log(`⏳ انتظار ${waitTime/1000} ثانية بين الطلبات...`);
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+
         try {
             const result = await sendToGemini(prompt, pdf);
+            lastRequestTime = Date.now();
             if (!res.headersSent) {
                 res.set('Content-Type', 'text/plain; charset=utf-8');
                 res.send(result);
             }
         } catch (error) {
+            lastRequestTime = Date.now();
             if (!res.headersSent) {
-                res.status(500).json({ error: 'AI request failed' });
+                res.status(500).json({ error: error.message || 'AI request failed' });
             }
         }
-        await new Promise(r => setTimeout(r, REQUEST_DELAY));
     }
     isProcessing = false;
 }
@@ -172,6 +221,16 @@ async function processQueue() {
 app.post('/api/KIMO_DEV', (req, res) => {
     const clientIP = getClientIP(req);
     const { id, pass, data, PDF_BASE64 } = req.body;
+
+    const now = Date.now();
+    if (rateLimitBlockUntil > now) {
+        const waitSeconds = Math.ceil((rateLimitBlockUntil - now) / 1000);
+        console.log(`⏸️ طلب مؤجل بسبب Rate Limit - انتظار ${waitSeconds} ثانية`);
+        return res.status(429).json({ 
+            error: `Rate limit active, please wait ${waitSeconds} seconds`,
+            retryAfter: waitSeconds
+        });
+    }
 
     const hasText = data && data !== '';
     const hasPdf = PDF_BASE64 && PDF_BASE64 !== '';
@@ -217,11 +276,16 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
+    const now = Date.now();
     res.json({
         status: 'online',
         queue_length: requestQueue.length,
         processing: isProcessing,
         blocked_ips_count: blockedIPs.size,
+        rate_limit_active: rateLimitBlockUntil > now,
+        rate_limit_remaining_seconds: rateLimitBlockUntil > now ? Math.ceil((rateLimitBlockUntil - now) / 1000) : 0,
+        last_request_ms_ago: lastRequestTime ? Date.now() - lastRequestTime : null,
+        min_interval_ms: MIN_REQUEST_INTERVAL,
         timestamp: new Date().toISOString()
     });
 });
@@ -231,8 +295,10 @@ app.use('*', (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`نظام حماية IP مفعل - عدد IPs محظورة: ${blockedIPs.size}`);
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🛡️ نظام حماية IP مفعل - عدد IPs محظورة: ${blockedIPs.size}`);
+    console.log(`⏱️ الفاصل الزمني بين الطلبات: ${MIN_REQUEST_INTERVAL/1000} ثانية`);
+    console.log(`📊 نظام تنظيم الطلبات (Queue) مفعل`);
 });
 
 server.timeout = 320000;
