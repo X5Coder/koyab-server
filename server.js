@@ -4,12 +4,23 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🌐 ENV من Koyeb مباشرة
+// 🌐 ENV
 const GEMINI_API_KEY = process.env.API;
 const TELEGRAM_CHAT_ID = process.env.ID;
 const TELEGRAM_BOT_TOKEN = process.env.TOKEN;
 
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
+
+// 🧪 DEBUG ENV (مهم)
+function mask(str) {
+    if (!str) return '❌ NOT FOUND';
+    return str.substring(0, 5) + '*****' + str.substring(str.length - 5);
+}
+
+console.log("🔍 ENV CHECK:");
+console.log("API:", mask(GEMINI_API_KEY));
+console.log("ID:", TELEGRAM_CHAT_ID || '❌ NOT FOUND');
+console.log("TOKEN:", mask(TELEGRAM_BOT_TOKEN));
 
 // 🚫 حماية
 const blockedIPs = new Set();
@@ -17,7 +28,6 @@ const MAX_CONCURRENT = 3;
 let activeRequests = 0;
 const requestQueue = [];
 
-// 🧠 تقليل الحجم
 app.use(express.json({ limit: '20mb' }));
 
 // 🧠 IP
@@ -27,21 +37,30 @@ function getClientIP(req) {
     return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
-// 📩 Telegram
+// 📩 Telegram (FIXED + DEBUG)
 async function sendTelegramNotification(message) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+        console.log("⚠️ Telegram ENV missing");
+        return;
+    }
 
     try {
-        await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-            {
-                chat_id: TELEGRAM_CHAT_ID,
-                text: message
-            },
-            { timeout: 5000 }
-        );
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+        console.log("📤 Sending Telegram to:", TELEGRAM_CHAT_ID);
+
+        const res = await axios.post(url, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message
+        });
+
+        console.log("✅ Telegram sent:", res.data.ok);
+
     } catch (err) {
-        console.error('❌ Telegram Error:', err.message);
+        console.error("❌ Telegram Error:");
+        console.error("Status:", err.response?.status);
+        console.error("Data:", err.response?.data);
+        console.error("Message:", err.message);
     }
 }
 
@@ -125,6 +144,8 @@ function processQueue() {
     const job = requestQueue.shift();
     activeRequests++;
 
+    console.log(`📥 طلب ${job.id} بدأ التنفيذ`);
+
     (async () => {
         try {
             const result = await sendToGemini(job.prompt, job.pdf, job.id);
@@ -170,6 +191,8 @@ app.post('/api/KIMO_DEV', (req, res) => {
 
     const requestId = Date.now().toString();
 
+    console.log(`📥 طلب ${requestId} دخل الطابور`);
+
     requestQueue.push({
         res,
         prompt: data || '',
@@ -194,23 +217,11 @@ app.get('/', (req, res) => {
     res.send('Server running');
 });
 
-// ❌ 404
-app.use('*', (req, res) => {
-    res.status(404).json({ error: 'Not found' });
-});
-
-// 🛡️ حماية عامة
-process.on('uncaughtException', (err) => {
-    console.error('🔥 Uncaught Exception:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-    console.error('🔥 Unhandled Rejection:', err);
-});
-
 // 🚀 Start
 const server = app.listen(PORT, () => {
     console.log(`✅ Server running on ${PORT}`);
+    console.log("🤖 Telegram Notifications Active");
+    console.log("🛡️ IP Blocking Active");
 });
 
 server.timeout = 300000;
