@@ -13,15 +13,10 @@ const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/
 
 const blockedIPs = new Set();
 let rateLimitBlockUntil = 0;
-const MAX_CONCURRENT = 3;
-let activeRequests = 0;
-const requestQueue = [];
 
 function getClientIP(req) {
     const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) {
-        return forwarded.split(',')[0].trim();
-    }
+    if (forwarded) return forwarded.split(',')[0].trim();
     return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
@@ -83,9 +78,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Credentials', 'true');
 
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
@@ -95,19 +88,13 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1, requestId = null) {
     const parts = [{ text: prompt }];
     if (pdfBase64 && pdfBase64 !== '') {
         parts.push({
-            inline_data: {
-                mime_type: "application/pdf",
-                data: pdfBase64
-            }
+            inline_data: { mime_type: "application/pdf", data: pdfBase64 }
         });
     }
 
     const requestBody = {
         contents: [{ parts }],
-        generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 4000
-        }
+        generationConfig: { temperature: 0.1, maxOutputTokens: 4000 }
     };
 
     try {
@@ -135,70 +122,47 @@ async function sendToGemini(prompt, pdfBase64, attempt = 1, requestId = null) {
             true
         );
 
-        if (statusCode === 429 && attempt <= 5) {
-            let backoff = 0;
-            if (errorMessage) {
-                const match = errorMessage.match(/(\d+)s/);
-                if (match) backoff = parseInt(match[1]) * 1000;
-            }
-            if (backoff === 0) backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
-
-            const waitTime = backoff + 2000;
-            rateLimitBlockUntil = Date.now() + waitTime;
-
-            await sendTelegramNotification(
-                `⚠️ Rate Limit 429\n` +
-                `الانتظار: ${waitTime/1000} ثانية\n` +
-                `المحاولة: ${attempt}/5\n` +
-                `سيتم استئناف الطلبات بعد ${new Date(rateLimitBlockUntil).toLocaleTimeString()}`,
-                true
-            );
-
-            await new Promise(r => setTimeout(r, waitTime));
-            return sendToGemini(prompt, pdfBase64, attempt + 1, requestId);
-        }
-
         throw new Error(`AI_REQUEST_FAILED: ${errorMessage}`);
     }
 }
 
-async function processQueue() {
-    if (activeRequests >= MAX_CONCURRENT) return;
+// ================= Queue + Worker =================
+const requestQueue = [];
+let isWorkerBusy = false;
+
+async function processNext() {
+    if (isWorkerBusy) return;
     if (requestQueue.length === 0) return;
 
-    const now = Date.now();
-    if (rateLimitBlockUntil > now) {
-        const waitTime = rateLimitBlockUntil - now;
-        console.log(`⏳ Rate Limit نشط، انتظار ${waitTime/1000} ثانية...`);
-        setTimeout(processQueue, waitTime);
-        return;
-    }
+    const job = requestQueue.shift();
+    const { res, prompt, pdf, requestId } = job;
 
-    while (requestQueue.length > 0 && activeRequests < MAX_CONCURRENT) {
-        const job = requestQueue.shift();
-        const { res, prompt, pdf, requestId } = job;
+    isWorkerBusy = true;
 
-        activeRequests++;
-
-        (async () => {
-            try {
-                const result = await sendToGemini(prompt, pdf, 1, requestId);
-                if (!res.headersSent) {
-                    res.set('Content-Type', 'text/plain; charset=utf-8');
-                    res.send(result);
-                }
-            } catch (error) {
-                if (!res.headersSent) {
-                    res.status(500).json({ error: error.message || 'AI request failed' });
-                }
-            } finally {
-                activeRequests--;
-                processQueue();
-            }
-        })();
+    try {
+        const result = await sendToGemini(prompt, pdf, 1, requestId);
+        if (!res.headersSent) {
+            res.set('Content-Type', 'text/plain; charset=utf-8');
+            res.send(result);
+        }
+        // بعد أي طلب ناجح، انتظر 2 ثانية قبل معالجة التالي
+        setTimeout(() => {
+            isWorkerBusy = false;
+            processNext();
+        }, 2000);
+    } catch (err) {
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message || 'AI request failed' });
+        }
+        // بعد أي فشل، انتظر 12 ثانية قبل معالجة التالي
+        setTimeout(() => {
+            isWorkerBusy = false;
+            processNext();
+        }, 12000);
     }
 }
 
+// ================= API Endpoint =================
 app.post('/api/KIMO_DEV', (req, res) => {
     const clientIP = getClientIP(req);
     const { id, pass, data, PDF_BASE64 } = req.body;
@@ -243,27 +207,18 @@ app.post('/api/KIMO_DEV', (req, res) => {
 
     req.setTimeout(310000);
 
-    requestQueue.push({
-        res,
-        prompt: data,
-        pdf: PDF_BASE64,
-        requestId
-    });
-
-    processQueue();
+    requestQueue.push({ res, prompt: data, pdf: PDF_BASE64, requestId });
+    processNext();
 });
 
-app.get('/', (req, res) => {
-    res.status(200).send('Server is running');
-});
+app.get('/', (req, res) => res.status(200).send('Server is running'));
 
 app.get('/api/health', (req, res) => {
     const now = Date.now();
     res.json({
         status: 'online',
         queue_length: requestQueue.length,
-        active_requests: activeRequests,
-        max_concurrent: MAX_CONCURRENT,
+        worker_busy: isWorkerBusy,
         blocked_ips_count: blockedIPs.size,
         rate_limit_active: rateLimitBlockUntil > now,
         rate_limit_remaining_seconds: rateLimitBlockUntil > now ? Math.ceil((rateLimitBlockUntil - now)/1000) : 0,
@@ -271,13 +226,9 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-app.use('*', (req, res) => {
-    res.status(404).json({ error: 'Not found' });
-});
+app.use('*', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-const server = app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-});
+const server = app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 server.timeout = 320000;
 server.keepAliveTimeout = 120000;
