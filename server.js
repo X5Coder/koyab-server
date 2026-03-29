@@ -1,27 +1,23 @@
 const express = require('express');
 const axios = require('axios');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ENV
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// 🌐 ENV من Koyeb مباشرة
+const GEMINI_API_KEY = process.env.API;
+const TELEGRAM_CHAT_ID = process.env.ID;
+const TELEGRAM_BOT_TOKEN = process.env.TOKEN;
 
-const GEMINI_API_URL =
-'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
-// حماية
+// 🚫 حماية
 const blockedIPs = new Set();
-let rateLimitBlockUntil = 0;
-
 const MAX_CONCURRENT = 3;
 let activeRequests = 0;
 const requestQueue = [];
 
-// مهم: قلل الحجم
+// 🧠 تقليل الحجم
 app.use(express.json({ limit: '20mb' }));
 
 // 🧠 IP
@@ -38,7 +34,10 @@ async function sendTelegramNotification(message) {
     try {
         await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-            { chat_id: TELEGRAM_CHAT_ID, text: message },
+            {
+                chat_id: TELEGRAM_CHAT_ID,
+                text: message
+            },
             { timeout: 5000 }
         );
     } catch (err) {
@@ -47,7 +46,7 @@ async function sendTelegramNotification(message) {
 }
 
 // 🚫 Block
-function blockAndNotify(ip, reason, req, body = {}) {
+function blockAndNotify(ip, reason, req) {
     if (blockedIPs.has(ip)) return;
 
     blockedIPs.add(ip);
@@ -60,12 +59,14 @@ Agent: ${req.headers['user-agent']}`;
     sendTelegramNotification(message);
 }
 
-// 🔒 IP Middleware
+// 🔒 Middleware
 app.use((req, res, next) => {
     const ip = getClientIP(req);
+
     if (blockedIPs.has(ip)) {
         return res.status(403).json({ error: 'IP blocked' });
     }
+
     next();
 });
 
@@ -74,6 +75,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', '*');
     res.header('Access-Control-Allow-Methods', '*');
+
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
@@ -126,13 +128,16 @@ function processQueue() {
     (async () => {
         try {
             const result = await sendToGemini(job.prompt, job.pdf, job.id);
+
             if (!job.res.headersSent) {
                 job.res.send(result);
             }
+
         } catch (e) {
             if (!job.res.headersSent) {
                 job.res.status(500).json({ error: e.message });
             }
+
         } finally {
             activeRequests--;
             processQueue();
@@ -194,7 +199,7 @@ app.use('*', (req, res) => {
     res.status(404).json({ error: 'Not found' });
 });
 
-// 🛡️ GLOBAL PROTECTION
+// 🛡️ حماية عامة
 process.on('uncaughtException', (err) => {
     console.error('🔥 Uncaught Exception:', err);
 });
