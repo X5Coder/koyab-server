@@ -10,7 +10,7 @@ const TELEGRAM_CHAT_ID = process.env.ID;
 const GEMINI_API_KEY = process.env.API;
 
 const GEMINI_API_URL =
-'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
 const blockedIPs = new Set();
 let rateLimitBlockUntil = 0;
@@ -19,279 +19,230 @@ let activeRequests = 0;
 const requestQueue = [];
 
 function getClientIP(req) {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) {
-        return forwarded.split(',')[0].trim();
-    }
-    return req.socket.remoteAddress || req.ip || 'unknown';
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
 async function sendTelegramNotification(message, isError = true) {
-    try {
-        await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-            { chat_id: TELEGRAM_CHAT_ID, text: message },
-            { timeout: 5000 }
-        );
-        console.log(`📨 تم إرسال إشعار: ${message.substring(0, 50)}...`);
-    } catch (err) {
-        console.error('❌ فشل إرسال إشعار:', err.message);
-    }
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      { chat_id: TELEGRAM_CHAT_ID, text: message },
+      { timeout: 5000 }
+    );
+    console.log(`📨 تم إرسال إشعار: ${message.substring(0, 50)}...`);
+  } catch (err) {
+    console.error('❌ فشل إرسال إشعار:', err.message);
+  }
 }
 
 function blockAndNotify(ip, reason, req, requestBody = null) {
-    if (blockedIPs.has(ip)) return;
-    
-    blockedIPs.add(ip);
-    
-    const userAgent = req.headers['user-agent'] || 'غير معروف';
-    const timestamp = new Date().toISOString();
-    
-    let requestDetails = '';
-    if (requestBody) {
-        if (requestBody.data) {
-            const promptPreview = requestBody.data.length > 300 ? requestBody.data.substring(0, 300) + '...' : requestBody.data;
-            requestDetails += `\n📝 النص: ${promptPreview}`;
-        }
-        if (requestBody.PDF_BASE64) {
-            const pdfSize = Math.round(requestBody.PDF_BASE64.length * 0.75 / 1024);
-            requestDetails += `\n📄 PDF: ${pdfSize} KB`;
-        }
+  if (blockedIPs.has(ip)) return;
+  blockedIPs.add(ip);
+
+  const userAgent = req.headers['user-agent'] || 'غير معروف';
+  const timestamp = new Date().toISOString();
+
+  let requestDetails = '';
+  if (requestBody) {
+    if (requestBody.data) {
+      const promptPreview =
+        requestBody.data.length > 300
+          ? requestBody.data.substring(0, 300) + '...'
+          : requestBody.data;
+      requestDetails += `\n📝 النص: ${promptPreview}`;
     }
-    
-    const message = `🚨 حظر IP 🚨\n` +
-                    `السبب: ${reason}\n` +
-                    `IP: ${ip}\n` +
-                    `المتصفح: ${userAgent}\n` +
-                    `الوقت: ${timestamp}${requestDetails}`;
-    
-    sendTelegramNotification(message, true);
-    console.log(`🚫 تم حظر ${ip} - ${reason}`);
+    if (requestBody.PDF_BASE64) {
+      const pdfSize = Math.round((requestBody.PDF_BASE64.length * 0.75) / 1024);
+      requestDetails += `\n📄 PDF: ${pdfSize} KB`;
+    }
+  }
+
+  const message = `🚨 حظر IP 🚨\n` +
+                  `السبب: ${reason}\n` +
+                  `IP: ${ip}\n` +
+                  `المتصفح: ${userAgent}\n` +
+                  `الوقت: ${timestamp}${requestDetails}`;
+
+  sendTelegramNotification(message, true);
+  console.log(`🚫 تم حظر ${ip} - ${reason}`);
 }
 
+// Middleware لحظر IP
 app.use((req, res, next) => {
-    const clientIP = getClientIP(req);
-    
-    if (blockedIPs.has(clientIP)) {
-        console.log(`🚫 مرفوض من IP محظور: ${clientIP}`);
-        res.status(403).json({ error: 'IP blocked' });
-        return;
-    }
-    
-    next();
+  const clientIP = getClientIP(req);
+  if (blockedIPs.has(clientIP)) {
+    console.log(`🚫 مرفوض من IP محظور: ${clientIP}`);
+    res.status(403).json({ error: 'IP blocked' });
+    return;
+  }
+  next();
 });
 
+// CORS
 app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    res.header('Access-Control-Allow-Origin', origin || '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Credentials', 'true');
+  const origin = req.headers.origin;
+  res.header('Access-Control-Allow-Origin', origin || '*');
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+  );
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Credentials', 'true');
 
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
 
 app.use(express.json({ limit: '500mb' }));
 
-async function sendToGemini(prompt, pdfBase64, attempt = 1, requestId = null) {
-    const parts = [{ text: prompt }];
+// --- Retry Delays محددة بالثواني ---
+const RETRY_DELAYS = [12000, 22000, 30000]; // 12s, 22s, 30s
 
-    if (pdfBase64 && pdfBase64 !== '') {
-        parts.push({
-            inline_data: {
-                mime_type: "application/pdf",
-                data: pdfBase64
-            }
-        });
+async function sendToGemini(prompt, pdfBase64, attempt = 0, requestId = null) {
+  const parts = [{ text: prompt }];
+  if (pdfBase64 && pdfBase64 !== '') {
+    parts.push({ inline_data: { mime_type: 'application/pdf', data: pdfBase64 } });
+  }
+
+  const requestBody = { contents: [{ parts }], generationConfig: { temperature: 0.1, maxOutputTokens: 4000 } };
+
+  try {
+    const response = await axios.post(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, requestBody, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 300000
+    });
+
+    if (response.data?.candidates?.[0]) return response.data.candidates[0].content.parts[0].text;
+    throw new Error('INVALID_GEMINI_RESPONSE');
+
+  } catch (error) {
+    const errorMessage = error.response?.data?.error?.message || error.message;
+    const statusCode = error.response?.status;
+
+    await sendTelegramNotification(
+      `⚠️ خطأ في طلب Gemini\n` +
+      `المعرف: ${requestId || 'غير معروف'}\n` +
+      `الحالة: ${statusCode || 'unknown'}\n` +
+      `المحاولة: ${attempt + 1}/${RETRY_DELAYS.length}\n` +
+      `الخطأ: ${errorMessage}\n` +
+      `الوقت: ${new Date().toISOString()}`,
+      true
+    );
+
+    if (attempt < RETRY_DELAYS.length) {
+      const waitTime = RETRY_DELAYS[attempt];
+      rateLimitBlockUntil = Date.now() + waitTime;
+
+      console.log(`⏳ Waiting ${waitTime / 1000}s before retry (attempt ${attempt + 1})`);
+      await new Promise((r) => setTimeout(r, waitTime));
+      return sendToGemini(prompt, pdfBase64, attempt + 1, requestId);
     }
 
-    const requestBody = {
-        contents: [{ parts }],
-        generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 4000
-        }
-    };
-
-    try {
-        const response = await axios.post(
-            `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
-            requestBody,
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 300000
-            }
-        );
-
-        if (response.data?.candidates?.[0]) {
-            return response.data.candidates[0].content.parts[0].text;
-        }
-        throw new Error('INVALID_GEMINI_RESPONSE');
-
-    } catch (error) {
-        const errorMessage = error.response?.data?.error?.message || error.message;
-        const statusCode = error.response?.status;
-        
-        await sendTelegramNotification(
-            `⚠️ خطأ في طلب Gemini\n` +
-            `المعرف: ${requestId || 'غير معروف'}\n` +
-            `الحالة: ${statusCode || 'unknown'}\n` +
-            `المحاولة: ${attempt}\n` +
-            `الخطأ: ${errorMessage}\n` +
-            `الوقت: ${new Date().toISOString()}`,
-            true
-        );
-        
-        if (statusCode === 429 && attempt <= 5) {
-            let backoff = 0;
-            if (errorMessage) {
-                const match = errorMessage.match(/(\d+)s/);
-                if (match) {
-                    backoff = parseInt(match[1]) * 1000;
-                }
-            }
-            if (backoff === 0) {
-                backoff = Math.min(60000, 5000 * Math.pow(2, attempt));
-            }
-            
-            const waitTime = backoff + 2000;
-            rateLimitBlockUntil = Date.now() + waitTime;
-            
-            await sendTelegramNotification(
-                `⚠️ Rate Limit 429\n` +
-                `الانتظار: ${waitTime/1000} ثانية\n` +
-                `المحاولة: ${attempt}/5\n` +
-                `سيتم استئناف الطلبات بعد ${new Date(rateLimitBlockUntil).toLocaleTimeString()}`,
-                true
-            );
-            
-            await new Promise(r => setTimeout(r, waitTime));
-            return sendToGemini(prompt, pdfBase64, attempt + 1, requestId);
-        }
-        
-        throw new Error(`AI_REQUEST_FAILED: ${errorMessage}`);
-    }
+    throw new Error(`AI_REQUEST_FAILED: ${errorMessage}`);
+  }
 }
 
 async function processQueue() {
-    if (activeRequests >= MAX_CONCURRENT) return;
-    if (requestQueue.length === 0) return;
-    
-    const now = Date.now();
-    if (rateLimitBlockUntil > now) {
-        const waitTime = rateLimitBlockUntil - now;
-        console.log(`⏳ Rate Limit نشط، انتظار ${waitTime/1000} ثانية...`);
-        setTimeout(processQueue, waitTime);
-        return;
-    }
-    
-    while (requestQueue.length > 0 && activeRequests < MAX_CONCURRENT) {
-        const job = requestQueue.shift();
-        const { res, prompt, pdf, requestId } = job;
-        
-        activeRequests++;
-        
-        (async () => {
-            try {
-                const result = await sendToGemini(prompt, pdf, 1, requestId);
-                if (!res.headersSent) {
-                    res.set('Content-Type', 'text/plain; charset=utf-8');
-                    res.send(result);
-                }
-            } catch (error) {
-                if (!res.headersSent) {
-                    res.status(500).json({ error: error.message || 'AI request failed' });
-                }
-            } finally {
-                activeRequests--;
-                processQueue();
-            }
-        })();
-    }
+  if (activeRequests >= MAX_CONCURRENT) return;
+  if (requestQueue.length === 0) return;
+
+  const now = Date.now();
+  if (rateLimitBlockUntil > now) {
+    const waitTime = rateLimitBlockUntil - now;
+    console.log(`⏳ Rate Limit نشط، انتظار ${waitTime / 1000} ثانية...`);
+    setTimeout(processQueue, waitTime);
+    return;
+  }
+
+  while (requestQueue.length > 0 && activeRequests < MAX_CONCURRENT) {
+    const job = requestQueue.shift();
+    const { res, prompt, pdf, requestId } = job;
+
+    activeRequests++;
+
+    (async () => {
+      try {
+        const result = await sendToGemini(prompt, pdf, 0, requestId);
+        if (!res.headersSent) {
+          res.set('Content-Type', 'text/plain; charset=utf-8');
+          res.send(result);
+        }
+      } catch (error) {
+        if (!res.headersSent) {
+          res.status(500).json({ error: error.message || 'AI request failed' });
+        }
+      } finally {
+        activeRequests--;
+        processQueue();
+      }
+    })();
+  }
 }
 
+// --- Endpoint رئيسي
 app.post('/api/KIMO_DEV', (req, res) => {
-    const clientIP = getClientIP(req);
-    const { id, pass, data, PDF_BASE64 } = req.body;
-    const requestId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  const clientIP = getClientIP(req);
+  const { id, pass, data, PDF_BASE64 } = req.body;
+  const requestId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
-    const now = Date.now();
-    if (rateLimitBlockUntil > now) {
-        const waitSeconds = Math.ceil((rateLimitBlockUntil - now) / 1000);
-        return res.status(429).json({ 
-            error: `Rate limit active, please wait ${waitSeconds} seconds`,
-            retryAfter: waitSeconds
-        });
-    }
+  const now = Date.now();
+  if (rateLimitBlockUntil > now) {
+    const waitSeconds = Math.ceil((rateLimitBlockUntil - now) / 1000);
+    return res.status(429).json({ error: `Rate limit active, please wait ${waitSeconds} seconds`, retryAfter: waitSeconds });
+  }
 
-    const hasText = data && data !== '';
-    const hasPdf = PDF_BASE64 && PDF_BASE64 !== '';
+  const hasText = data && data !== '';
+  const hasPdf = PDF_BASE64 && PDF_BASE64 !== '';
 
-    if (hasText && !hasPdf) {
-        blockAndNotify(clientIP, 'نص فقط بدون PDF', req, { data, PDF_BASE64 });
-        return res.status(403).json({ error: 'نص فقط بدون ملف PDF - تم حظرك' });
-    }
-    
-    if (!hasText && hasPdf) {
-        blockAndNotify(clientIP, 'PDF فقط بدون نص', req, { data, PDF_BASE64 });
-        return res.status(403).json({ error: 'PDF فقط بدون نص - تم حظرك' });
-    }
-    
-    if (!hasText && !hasPdf) {
-        blockAndNotify(clientIP, 'طلب فارغ', req, { data, PDF_BASE64 });
-        return res.status(403).json({ error: 'طلب فارغ - تم حظرك' });
-    }
+  if (hasText && !hasPdf) {
+    blockAndNotify(clientIP, 'نص فقط بدون PDF', req, { data, PDF_BASE64 });
+    return res.status(403).json({ error: 'نص فقط بدون ملف PDF - تم حظرك' });
+  }
+  if (!hasText && hasPdf) {
+    blockAndNotify(clientIP, 'PDF فقط بدون نص', req, { data, PDF_BASE64 });
+    return res.status(403).json({ error: 'PDF فقط بدون نص - تم حظرك' });
+  }
+  if (!hasText && !hasPdf) {
+    blockAndNotify(clientIP, 'طلب فارغ', req, { data, PDF_BASE64 });
+    return res.status(403).json({ error: 'طلب فارغ - تم حظرك' });
+  }
 
-    if (!id || !pass) {
-        blockAndNotify(clientIP, 'بدون id/pass', req, { data, PDF_BASE64 });
-        return res.status(403).json({ error: 'بيانات غير صحيحة' });
-    }
+  if (!id || !pass) {
+    blockAndNotify(clientIP, 'بدون id/pass', req, { data, PDF_BASE64 });
+    return res.status(403).json({ error: 'بيانات غير صحيحة' });
+  }
+  if (pass !== id + 'abcde57') {
+    blockAndNotify(clientIP, `pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
+    return res.status(403).json({ error: 'بيانات غير صحيحة' });
+  }
 
-    if (pass !== id + 'abcde57') {
-        blockAndNotify(clientIP, `pass غير صحيح للمستخدم: ${id}`, req, { data, PDF_BASE64 });
-        return res.status(403).json({ error: 'بيانات غير صحيحة' });
-    }
+  req.setTimeout(310000);
 
-    req.setTimeout(310000);
-
-    requestQueue.push({
-        res,
-        prompt: data,
-        pdf: PDF_BASE64,
-        requestId
-    });
-
-    processQueue();
+  requestQueue.push({ res, prompt: data, pdf: PDF_BASE64, requestId });
+  processQueue();
 });
 
-app.get('/', (req, res) => {
-    res.status(200).send('Server is running');
-});
-
+// --- Health & Root
+app.get('/', (req, res) => res.status(200).send('Server is running'));
 app.get('/api/health', (req, res) => {
-    const now = Date.now();
-    res.json({
-        status: 'online',
-        queue_length: requestQueue.length,
-        active_requests: activeRequests,
-        max_concurrent: MAX_CONCURRENT,
-        blocked_ips_count: blockedIPs.size,
-        rate_limit_active: rateLimitBlockUntil > now,
-        rate_limit_remaining_seconds: rateLimitBlockUntil > now ? Math.ceil((rateLimitBlockUntil - now) / 1000) : 0,
-        timestamp: new Date().toISOString()
-    });
+  const now = Date.now();
+  res.json({
+    status: 'online',
+    queue_length: requestQueue.length,
+    active_requests: activeRequests,
+    max_concurrent: MAX_CONCURRENT,
+    blocked_ips_count: blockedIPs.size,
+    rate_limit_active: rateLimitBlockUntil > now,
+    rate_limit_remaining_seconds: rateLimitBlockUntil > now ? Math.ceil((rateLimitBlockUntil - now) / 1000) : 0,
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.use('*', (req, res) => {
-    res.status(404).json({ error: 'Not found' });
-});
+app.use('*', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-const server = app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-});
+const server = app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 server.timeout = 320000;
 server.keepAliveTimeout = 120000;
