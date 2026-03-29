@@ -1,3 +1,0 @@
-SMART SERVER
-
- BY KIMO
